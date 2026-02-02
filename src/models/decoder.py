@@ -2,143 +2,126 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class IBGate(nn.Module):
-    def __init__(self, in_channels, reduction=4):
-        super().__init__()
-        mid_channels = in_channels // reduction
-        self.gate_encoder = nn.Sequential(
-            nn.Conv2d(in_channels + 1, mid_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(8, mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, in_channels * 2, kernel_size=1),
-        )
-        
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x, lambda_map):
-        if lambda_map.shape[-2:] != x.shape[-2:]:
-            gate_map = F.interpolate(lambda_map, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        else:
-            gate_map = lambda_map
-
-        gate_params = self.gate_encoder(torch.cat([x, gate_map], dim=1))
-        mu, logvar = gate_params.chunk(2, dim=1)
-        
-        # Stability Clamp
-        logvar = torch.clamp(logvar, min=-10, max=10)
-        
-        z = self.reparameterize(mu, logvar) if self.training else mu
-        gate = torch.sigmoid(z)
-        
-        kld_element = 1 + logvar - mu.pow(2) - logvar.exp()
-        kld_loss = -0.5 * torch.mean(kld_element)
-        
-        return x * (1 + gate), kld_loss
-
-class FeatureDifferenceModule(nn.Module):
+class MLP(nn.Module):
     """
-    Asymmetric Difference Module.
+    Simple MLP block: Linear -> ReLU -> Linear
+    Literature: SegFormer (NeurIPS 2021)
     """
-    def __init__(self, in_channels):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        num_groups = 32 if in_channels >= 32 else 4
-        # Input channels = in_channels * 3 (T1, T2, T1-T2)
+        self.proj = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        return self.proj(x)
+
+class SegFormerHead(nn.Module):
+    """
+    SegFormer-style All-MLP Decoder.
+    1. Projects multi-scale features to common dimension C.
+    2. Upsamples all to 1/4 resolution.
+    3. Concatenates -> 4*C.
+    4. Predicts class logits.
+    
+    Why SOTA?
+    - Removes heavy convolutions/attention from decoder.
+    - Relies on the Encoder (Mamba) for global context.
+    - Extremely fast and memory efficient.
+    """
+    def __init__(self, encoder_dims, embedding_dim=128, num_classes=7):
+        super().__init__()
+        self.linear_layers = nn.ModuleList()
+        self.scaling_factor = 4 # Upsample to 1/4 resolution
+        
+        # 1. MLP Projections for each scale
+        for dim in encoder_dims:
+            self.linear_layers.append(MLP(dim, embedding_dim))
+
+        # 2. Fusion Layer
+        # Input: 4 scales * embedding_dim
         self.fusion = nn.Sequential(
-            nn.Conv2d(in_channels * 3, in_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups, in_channels), 
+            nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(16, embedding_dim),
             nn.ReLU(inplace=True)
         )
         
-    def forward(self, f1, f2):
-        return self.fusion(torch.cat([f1, f2, f1 - f2], dim=1))
-
-class LightweightFusionBlock(nn.Module):
-    """
-    [LIGHTWEIGHT REPLACEMENT]
-    Replaces the heavy MambaFusionBlock with a standard Residual Conv Block.
-    The Encoder (Mamba) already did the global context heavy lifting.
-    The Decoder just needs to fuse and refine locally.
-    """
-    def __init__(self, in_channels, skip_channels, out_channels):
-        super().__init__()
-        self.skip_proj = nn.Conv2d(skip_channels, in_channels, kernel_size=1, bias=False)
+        # 3. Classifier Head
+        self.classifier = nn.Conv2d(embedding_dim, num_classes, kernel_size=1)
         
-        num_groups = 32 if out_channels >= 32 else 4
-        
-        # ResNet-style Residual Block
-        self.conv1 = nn.Conv2d(in_channels * 2, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.GroupNorm(num_groups, out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.GroupNorm(num_groups, out_channels)
-        
-        self.downsample = None
-        if in_channels * 2 != out_channels:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False),
-                nn.GroupNorm(num_groups, out_channels)
-            )
-
-    def forward(self, x, skip):
-        x_up = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
-        skip_proj = self.skip_proj(skip)
-        
-        out = torch.cat([x_up, skip_proj], dim=1)
-        residual = out
-        
-        out = self.conv1(out)
-        out = self.bn1(out)
-        out = self.relu(out)
-        
-        out = self.conv2(out)
-        out = self.bn2(out)
-        
-        if self.downsample is not None:
-            residual = self.downsample(residual)
-            
-        out += residual
-        return self.relu(out)
-
-class MultiScaleMambaDecoder(nn.Module):
-    def __init__(self, encoder_dims, num_classes):
-        super().__init__()
-        # [UPGRADE] Using LightweightFusionBlock
-        self.stage1 = LightweightFusionBlock(encoder_dims[3], encoder_dims[2], encoder_dims[2])
-        self.stage2 = LightweightFusionBlock(encoder_dims[2], encoder_dims[1], encoder_dims[1])
-        self.stage3 = LightweightFusionBlock(encoder_dims[1], encoder_dims[0], encoder_dims[0])
-        
-        self.ib_gate = IBGate(encoder_dims[3])
-        self.head = nn.Conv2d(encoder_dims[0], num_classes, kernel_size=1)
-        self.aux1 = nn.Conv2d(encoder_dims[2], num_classes, kernel_size=1) 
-        self.aux2 = nn.Conv2d(encoder_dims[1], num_classes, kernel_size=1)
+        # 4. Aux Head (Optional Deep Supervision on deep features)
+        self.aux_head = nn.Conv2d(embedding_dim, num_classes, kernel_size=1)
 
     def forward(self, features, lambda_map=None):
-        c1, c2, c3, c4 = features
-        x, kld = self.ib_gate(c4, lambda_map) if lambda_map is not None else (c4, torch.tensor(0.0, device=c1.device))
-        x = self.stage1(x, c3)
-        a1 = self.aux1(x)
-        x = self.stage2(x, c2)
-        a2 = self.aux2(x)
-        x = self.stage3(x, c1)
-        return self.head(x), [a1, a2], kld
-
-class BCDDecoder(nn.Module):
-    def __init__(self, encoder_dims):
-        super().__init__()
-        self.diff_extractors = nn.ModuleList([FeatureDifferenceModule(dim) for dim in encoder_dims])
-        # [UPGRADE] Using LightweightFusionBlock
-        self.stage1 = LightweightFusionBlock(encoder_dims[3], encoder_dims[2], encoder_dims[2])
-        self.stage2 = LightweightFusionBlock(encoder_dims[2], encoder_dims[1], encoder_dims[1])
-        self.stage3 = LightweightFusionBlock(encoder_dims[1], encoder_dims[0], encoder_dims[0])
-        self.head = nn.Conv2d(encoder_dims[0], 1, kernel_size=1)
+        # features list: [c1, c2, c3, c4]
+        # c1: 1/4, c2: 1/8, c3: 1/16, c4: 1/32
         
-    def forward(self, feats_t1, feats_t2, lambda_map):
-        diffs = [self.diff_extractors[i](f1, f2) for i, (f1, f2) in enumerate(zip(feats_t1, feats_t2))]
-        x = self.stage1(diffs[3], diffs[2])
-        x = self.stage2(x, diffs[1])
-        x = self.stage3(x, diffs[0])
-        return self.head(x)
+        batch_size = features[0].shape[0]
+        
+        # Target size is 1/4 resolution (shape of c1)
+        H_target, W_target = features[0].shape[2], features[0].shape[3]
+        
+        outs = []
+        for i, feat in enumerate(features):
+            # Flatten: [B, C, H, W] -> [B, H*W, C] -> MLP -> [B, C, H, W]
+            B, C, H, W = feat.shape
+            
+            # Apply MLP (Linear layer works on last dim)
+            feat_flat = feat.flatten(2).transpose(1, 2) # [B, L, C]
+            embed = self.linear_layers[i](feat_flat)
+            embed = embed.transpose(1, 2).reshape(B, -1, H, W) # Back to [B, Emb, H, W]
+            
+            # Upsample to common resolution (1/4)
+            if i > 0:
+                embed = F.interpolate(embed, size=(H_target, W_target), mode='bilinear', align_corners=False)
+            
+            outs.append(embed)
+            
+        # Concatenate: [B, 4*Emb, H/4, W/4]
+        concat_feats = torch.cat(outs, dim=1)
+        
+        # Fuse
+        fused = self.fusion(concat_feats)
+        
+        # Apply Information Bottleneck (IB) gating if provided
+        kld_loss = torch.tensor(0.0, device=fused.device)
+        if lambda_map is not None:
+            # Resize lambda to 1/4 if needed
+            if lambda_map.shape[-2:] != fused.shape[-2:]:
+                lambda_map = F.interpolate(lambda_map, size=fused.shape[-2:], mode='bilinear', align_corners=False)
+            
+            # Gate features: Multiply by validity mask (1=Valid, 0=Changed/Occluded)
+            fused = fused * lambda_map 
+            
+            # (Optional) Simple KLD regularization on the fusion magnitude could go here, 
+            # but for MLP decoder we usually skip complex VAE logic to keep it light.
+            
+        # Prediction
+        logits = self.classifier(fused)
+        
+        # Aux output (from the deepest feature, upsampled)
+        aux_out = self.aux_head(outs[-1]) 
+        
+        return logits, [aux_out], kld_loss
+
+class LightweightBCDDecoder(nn.Module):
+    """
+    Computes Binary Change from the fused Semantic Features.
+    Difference -> MLP -> Logits.
+    """
+    def __init__(self, embedding_dim=128):
+        super().__init__()
+        # Input is 2 * embedding_dim (concatenated T1 and T2 fused features)
+        self.proj = nn.Sequential(
+            nn.Conv2d(embedding_dim * 2, embedding_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(16, embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embedding_dim, 1, kernel_size=1)
+        )
+        
+    def forward(self, fused_t1, fused_t2):
+        # We assume fused_t1 and fused_t2 are the outputs of the SegFormer Fusion layer
+        # They are already "Global Context Enriched"
+        
+        # Concatenate T1 and T2
+        x = torch.cat([fused_t1, fused_t2], dim=1)
+        logits = self.proj(x)
+        return logits
