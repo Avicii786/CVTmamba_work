@@ -49,7 +49,7 @@ class LambdaSCD(nn.Module):
         
         # 1. Backbone (CT-VMamba)
         self.backbone = CTVMambaBackbone(
-            in_chans=in_channels, embed_dims=embed_dims, depths=depths, drop_rate=drop_rate
+            in_channels=in_channels, embed_dims=embed_dims, depths=depths, drop_rate=drop_rate
         )
 
         # 2. SCM (Siamese Alignment)
